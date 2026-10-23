@@ -11,3 +11,4 @@ xcuserdata/
 *.key
 Resources/AppIcon.icns
 scripts/emulator/certs/
+Config/Local.xcconfig

@@ -10,9 +10,9 @@
 
 Bambu Bar is a native macOS app that shows your 3D printer's progress, temperatures and filament without opening Bambu Studio or Bambu Handy. Glance at the menu bar for percent and time left, click for everything else, or keep a widget on your desktop.
 
-Built with Swift and SwiftUI. No account, no cloud service, no analytics.
+Built with Swift and SwiftUI. No analytics, and no account needed: status and controls stay on your network. Only the optional live camera goes through Bambu Cloud.
 
-[Getting started](#getting-started) · [Features](#features) · [Widgets](#desktop-widgets) · [Compatibility](#compatibility) · [Building](#building-from-source)
+[Getting started](#getting-started) · [Features](#features) · [Camera](#live-camera) · [Widgets](#desktop-widgets) · [Compatibility](#compatibility) · [Building](#building-from-source)
 
 > Independent, community-developed software. Not affiliated with or endorsed by Bambu Lab. A P2S is the development printer; other Bambu Lab printers that speak the same LAN protocol (X1, P1, A1, H2) should work.
 
@@ -20,7 +20,7 @@ Built with Swift and SwiftUI. No account, no cloud service, no analytics.
 
 The printer is in another room, and the slicer is a big app to keep open just to see how long is left. Bambu Bar keeps the answer in the menu bar: **64% · 1h 02m**. Click it and a panel shows the job, the stage, temperatures, the spool in use and how much filament is left, with pause, stop, light and speed controls right there.
 
-It talks to the printer directly over your network, the same way Bambu Studio does in LAN mode, so it works with the printer still bound to your Bambu account and nothing goes through a cloud.
+It talks to the printer directly over your network, the same way Bambu Studio does in LAN mode, so it works with the printer still bound to your Bambu account and status never goes through a cloud. The live camera is the one exception: it streams through Bambu Cloud, like in Bambu Studio and Bambu Handy, once you sign in.
 
 ## Features
 
@@ -28,6 +28,7 @@ It talks to the printer directly over your network, the same way Bambu Studio do
 | --- | --- |
 | **Menu bar** | A printer glyph that fills as the print grows, with progress and time left beside it (or just one, or only the icon), and a pause or alert mark when the printer needs you. |
 | **Panel** | The job, its stage ("Heating hotend", "Paused: filament ran out"), percentage, layers, time left and finish time; nozzle, bed and chamber temperatures; AMS spools with what's left and the humidity; printer errors in plain English. |
+| **Live camera** | The printer's camera on the printer page, streamed through Bambu Cloud the way Bambu Studio shows it. Needs Bambu Studio installed and a sign-in with the Bambu account the printer is bound to; once enabled, it stays connected until turned off or the app quits. |
 | **Controls** | Pause, resume, stop (with a confirmation), print speed (Silent, Standard, Sport, Ludicrous) and a chamber light switch. |
 | **Drawn to match** | Each printer is drawn as its model, with the part growing in the colour of the filament in use: the P2S/P1S/X1 enclosure, the wider dual-nozzle H2, the open P1P frame, the A1's arch with its AMS Lite, the A1 mini. |
 | **Window** | A larger view plus fans, nozzle, door, network, storage and firmware; a Filament page with every spool; a Widgets page that tours every widget size and state. |
@@ -63,6 +64,18 @@ Builds on the [Releases](https://github.com/rolottr/bambu-bar/releases) page are
 
 Reading status works in any mode. Pause, resume, stop and speed changes are accepted only when the printer is in **LAN Only** mode with **Developer Mode** on (printer screen → Settings → Network). That's Bambu Lab's rule for third-party apps; without it the printer refuses the command and Bambu Bar says so (the buttons show a lock). The chamber light works either way.
 
+## Live camera
+
+The printer page has a camera card. Press play once; the stream stays connected when you switch tabs or close the window, until you turn it off or quit Bambu Bar. Reopening the printer page reuses the live stream. If left enabled, it reconnects on the next app launch.
+
+- **Sign in** under Settings → Bambu account, with the account the printer is bound to (email with a password or an emailed code, plus a 2FA code if your account has one).
+- **Bambu Studio** must be installed and opened once, so it has downloaded its network plugin. Bambu Bar's `bambu-camera` helper loads that plugin (`~/Library/Application Support/BambuStudio/plugins`) to ask Bambu for the camera link and play the stream. It runs as its own process, so the plugin can't take the app down, and it's the only part of the app that loads code not signed by Bambu Bar.
+- The stream is the printer's own H.264 video, decoded by macOS. It stops when you leave the page, close the window or the Mac sleeps.
+- Most printers serve one remote viewer at a time: with the camera open in Bambu Studio or Bambu Handy, Bambu Bar says it's in use.
+
+The camera runs inside the app bundle without Docker or a separate relay. Its helper uses the installed networking plugin's native signing metadata for cloud camera requests. This was verified on an H2C with macOS networking plugin `02.08.02.60`; plugin updates may require compatibility changes.
+- No LAN Only mode or LAN Only Liveview is needed.
+
 ## Desktop widgets
 
 <p align="center">
@@ -84,7 +97,7 @@ The widget shows what the app last saw, so keep Bambu Bar running (Open at Login
 | **P2S** | Development printer; verified with firmware **01.03.00.00** and an AMS 2 Pro. |
 | **X1, P1, A1, H2 families** | Same LAN protocol and certificate authorities; implemented, not verified on hardware. |
 
-The printer can be in cloud mode or LAN Only mode; controls need LAN Only with Developer Mode (see above). The camera is not shown.
+The printer can be in cloud mode or LAN Only mode; controls need LAN Only with Developer Mode (see above). The live camera works in cloud mode (see [Live camera](#live-camera)).
 
 If you try another model, [open an issue](https://github.com/rolottr/bambu-bar/issues) with the model, firmware, macOS version and what worked. Run `--probe` (below) for a report; remove the serial number and access code before posting it.
 
@@ -96,7 +109,10 @@ Printers announce themselves on UDP port 2021; that's how Bambu Bar lists them d
 
 ## Privacy and local storage
 
-No account, no analytics, no cloud. Bambu Bar talks only to your printers on your local network.
+No analytics. Status and controls go only to your printers on your local network. The live camera is opt-in: it needs a Bambu account sign-in and streams through Bambu's cloud.
+
+- **Bambu account session (camera only):** your login keychain. It's sent only to Bambu (`api.bambulab.com`) and to Bambu Studio's network plugin, which opens the camera.
+- **Camera log:** `~/Library/Logs/Bambu Bar/camera.log`, the last camera session's steps (no tokens or camera links).
 
 - **Printers (address, serial, name) and preferences:** local macOS user defaults.
 - **Access codes:** your login keychain.
@@ -115,7 +131,11 @@ cd bambu-bar
 ./scripts/install.sh --build     # rebuild first
 ```
 
-`build.sh` generates the Xcode project from `project.yml`, builds the app and its widget extension, and signs both with the first **Developer ID Application** identity in your keychain (override with `SIGN_IDENTITY=…`; set `TEAM_ID` to match its team, which names the app group the widget shares). Without one the app is signed ad hoc and works without the widget. `CONFIG=Debug` and `ARCHS=arm64` are available. Builds go into a `.noindex` folder so Spotlight and Launchpad only ever find the installed copy.
+To sign with your own team, put `DEVELOPMENT_TEAM = <your team id>` in `Config/Local.xcconfig` (gitignored). Xcode then runs Debug builds with your Apple Development identity (run `xcodegen generate` once, open `BambuBar.xcodeproj`, press Run), and `build.sh` signs with that team's Developer ID.
+
+To run from Xcode, put your team in `Config/Local.xcconfig` (not checked in), e.g. `DEVELOPMENT_TEAM = ABCDE12345`, run `xcodegen generate` and open `BambuBar.xcodeproj`. Debug builds sign automatically with your Apple Development certificate; Release builds use Developer ID.
+
+`build.sh` generates the Xcode project from `project.yml`, builds the app and its widget extension, and signs both with the **Developer ID Application** identity of your team (from `Config/Local.xcconfig`, else the first one in your keychain) (override with `SIGN_IDENTITY=…`; set `TEAM_ID` to match its team, which names the app group the widget shares). Without one the app is signed ad hoc and works without the widget. `CONFIG=Debug` and `ARCHS=arm64` are available. Builds go into a `.noindex` folder so Spotlight and Launchpad only ever find the installed copy.
 
 ### Package and notarize a release
 

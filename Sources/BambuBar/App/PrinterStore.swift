@@ -27,7 +27,7 @@ final class PrinterStore {
     static let shared = PrinterStore()
 
     private(set) var sessions: [PrinterSession] = []
-    private(set) var selectedSerial: String?
+    private(set) var selectedSerial: String? { didSet { syncCamera(restart: true) } }
     private(set) var history: [JobRecord] = []
     private(set) var discovered: [DiscoveredPrinter] = []
     /// Printers whose access code a slicer already knows (this Mac's Bambu Studio or OrcaSlicer, or a settings
@@ -37,6 +37,17 @@ final class PrinterStore {
     /// A short-lived message after a command ("The printer refused…").
     private(set) var toast: Toast?
     private(set) var isDemo = false
+
+    /// App-owned so navigation and window closure do not tear down the camera tunnel.
+    let cameraStream = CameraStream()
+    var cameraOn: Bool {
+        didSet {
+            defaults.set(cameraOn, forKey: "cameraOn")
+            syncCamera()
+        }
+    }
+    @ObservationIgnored private var cameraStartTask: Task<Void, Never>?
+    @ObservationIgnored private var cameraRequest = 0
 
     /// `nil` = automatic.
     var menuBarSerial: String? {
@@ -87,6 +98,7 @@ final class PrinterStore {
     }
 
     private init() {
+        cameraOn = defaults.bool(forKey: "cameraOn")
         menuBarStyle = MenuBarStyle(rawValue: defaults.string(forKey: Keys.menuBarStyle) ?? "") ?? .both
         notifyFinished = defaults.object(forKey: Keys.notifyFinished) as? Bool ?? true
         notifyFailed = defaults.object(forKey: Keys.notifyFailed) as? Bool ?? true
@@ -131,12 +143,46 @@ final class PrinterStore {
         if selectedSerial == nil || session(selectedSerial!) == nil { selectedSerial = sessions.first?.id }
         discovery.start()
         reloadSlicerPrinters()
+        syncCamera()
         writeSnapshot(force: true)
     }
 
     func stop() {
+        cancelCameraStart()
+        cameraStream.stop()
         for session in sessions { session.stop() }
         discovery.stop()
+    }
+
+    private func cancelCameraStart() {
+        cameraRequest += 1
+        cameraStartTask?.cancel()
+        cameraStartTask = nil
+    }
+
+    /// Keep one camera for the selected printer, independent of view visibility.
+    func syncCamera(restart: Bool = false) {
+        guard cameraOn, !isDemo, let config else {
+            cancelCameraStart()
+            cameraStream.stop()
+            return
+        }
+        if restart {
+            cancelCameraStart()
+            cameraStream.stop()
+        } else {
+            guard cameraStartTask == nil, !cameraStream.isRunning else { return }
+            if case .failed = cameraStream.phase { return }
+        }
+        cameraRequest += 1
+        let request = cameraRequest
+        cameraStartTask = Task { @MainActor [weak self] in
+            await BambuCloud.shared.refreshIfNeeded()
+            guard let self, !Task.isCancelled, self.cameraRequest == request,
+                  self.cameraOn, self.config?.serial == config.serial else { return }
+            self.cameraStartTask = nil
+            self.cameraStream.start(serial: config.serial, firmware: self.status?.firmware)
+        }
     }
 
     private func loadConfigs() -> [PrinterConfig] {

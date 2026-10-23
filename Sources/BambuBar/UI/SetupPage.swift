@@ -136,7 +136,7 @@ struct SetupPage: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Welcome to Bambu Bar")
                     .font(.system(size: 28, weight: .bold))
-                Text("Your printer's progress, temperatures and filament, one click away in the menu bar. Bambu Bar talks to the printer directly over your network: no account, no cloud.")
+                Text("Your printer's progress, temperatures and filament, one click away in the menu bar. Bambu Bar talks to the printer directly over your network, no account needed.")
                     .font(.system(size: 13.5))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

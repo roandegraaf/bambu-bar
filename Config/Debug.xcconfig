@@ -1,0 +1,5 @@
+// Xcode runs use the same Developer ID as the camera helper. Local.xcconfig overrides the team.
+CODE_SIGN_STYLE = Manual
+CODE_SIGN_IDENTITY = Developer ID Application
+DEVELOPMENT_TEAM = PCZ6F8Q9DZ
+#include? "Local.xcconfig"

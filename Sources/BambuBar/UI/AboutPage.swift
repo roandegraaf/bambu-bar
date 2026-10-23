@@ -40,7 +40,7 @@ struct AboutPage: View {
             }
 
             section("Privacy") {
-                paragraph("No account, no cloud, no analytics. Nothing leaves your network: Bambu Bar talks only to your printer. The access code is stored in your keychain.")
+                paragraph("No analytics. Status and controls stay on your network: Bambu Bar talks directly to your printer, and the access code is stored in your keychain. Only the optional live camera goes through Bambu Cloud, with a Bambu account you sign in to.")
             }
 
             section("Credits") {

@@ -9,6 +9,9 @@ struct SettingsPage: View {
     @State private var code = ""
     @State private var editingConnection = false
     @State private var confirmForget = false
+    @State private var cloudEmail = ""
+    @State private var cloudPassword = ""
+    @State private var cloudCode = ""
 
     var body: some View {
         @Bindable var store = store
@@ -82,6 +85,8 @@ struct SettingsPage: View {
                     }
                 }
             }
+
+            accountGroup
 
             group("Menu bar", symbol: "menubar.rectangle") {
                 if store.hasMultiplePrinters {
@@ -188,6 +193,107 @@ struct SettingsPage: View {
                     .controlSize(.small)
                     .disabled(isCurrent)
             }
+        }
+    }
+
+    @ViewBuilder
+    private var accountGroup: some View {
+        let cloud = BambuCloud.shared
+        group("Bambu account", symbol: "person.crop.circle") {
+            switch cloud.step {
+            case .signedIn:
+                if let session = cloud.session {
+                    row("Signed in as") {
+                        Text(session.name == session.email ? session.email : "\(session.name) (\(session.email))")
+                            .foregroundStyle(.secondary).textSelection(.enabled)
+                    }
+                }
+                if let config = store.config {
+                    row(store.hasMultiplePrinters ? "\(config.name) camera" : "Camera") {
+                        if cloud.device(serial: config.serial) != nil {
+                            Label("On this account", systemImage: "checkmark.circle.fill").foregroundStyle(Palette.accent)
+                        } else if cloud.devices.isEmpty {
+                            Text("—").foregroundStyle(.secondary)
+                        } else {
+                            Label("Not on this account", systemImage: "exclamationmark.triangle.fill").foregroundStyle(Palette.paused)
+                        }
+                    }
+                }
+                Divider()
+                HStack {
+                    Text("Used only for the live camera.").font(.system(size: 11.5)).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Sign Out") { cloud.signOut() }
+                }
+            case .signedOut:
+                row("Email") {
+                    TextField("Email", text: $cloudEmail).textFieldStyle(.roundedBorder).frame(width: 220)
+                        .textContentType(.username)
+                }
+                row("Password") {
+                    SecureField("Optional", text: $cloudPassword).textFieldStyle(.roundedBorder).frame(width: 220)
+                        .textContentType(.password)
+                        .onSubmit(signIn)
+                }
+                HStack(alignment: .top) {
+                    Text("Leave the password empty and Bambu emails you a code.")
+                        .font(.system(size: 11.5)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    Button("Sign In", action: signIn)
+                        .buttonStyle(.borderedProminent)
+                        .tint(Palette.accentDeep)
+                        .disabled(cloud.busy || !cloudEmail.contains("@"))
+                }
+            case .code(let email), .tfa(let email, _):
+                let tfa = if case .tfa = cloud.step { true } else { false }
+                Text(tfa ? "Enter the code from your authenticator app for \(email)." : "Bambu sent a code to \(email).")
+                    .font(.system(size: 12.5))
+                row(tfa ? "2FA code" : "Code") {
+                    TextField("123456", text: $cloudCode).textFieldStyle(.roundedBorder).frame(width: 220)
+                        .textContentType(.oneTimeCode)
+                        .onSubmit(submitCode)
+                }
+                HStack {
+                    Spacer()
+                    Button("Cancel") { cloud.cancelSignIn(); cloudCode = "" }
+                    Button("Verify", action: submitCode)
+                        .buttonStyle(.borderedProminent)
+                        .tint(Palette.accentDeep)
+                        .disabled(cloud.busy || cloudCode.trimmingCharacters(in: .whitespaces).count < 4)
+                }
+            }
+            if cloud.busy {
+                ProgressView().controlSize(.small)
+            }
+            if let error = cloud.error {
+                Text(error).font(.system(size: 11.5)).foregroundStyle(Palette.failed)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if cloud.step != .signedIn {
+                Text("The camera streams through Bambu Cloud, the way Bambu Studio and Bambu Handy show it, so it needs the account the printer is bound to. Bambu Bar sends the sign-in only to Bambu and keeps it in your keychain; status and controls stay on your network.")
+                    .font(.system(size: 11.5)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func signIn() {
+        let cloud = BambuCloud.shared
+        guard !cloud.busy, cloudEmail.contains("@") else { return }
+        Task {
+            await cloud.start(email: cloudEmail, password: cloudPassword)
+            if cloud.step == .signedIn { cloudPassword = "" }
+        }
+    }
+
+    private func submitCode() {
+        let cloud = BambuCloud.shared
+        guard !cloud.busy else { return }
+        let code = cloudCode
+        Task {
+            if case .tfa = cloud.step { await cloud.submitTfa(code) } else { await cloud.submitCode(code) }
+            if cloud.step == .signedIn { cloudCode = ""; cloudPassword = "" }
         }
     }
 

@@ -19,6 +19,7 @@ struct OverviewPage: View {
                     }
                 }
                 ForEach(status.issues) { IssueBanner(issue: $0) }
+                CameraCard()
                 metrics(status)
                 if !status.ams.isEmpty || status.externalSpool?.isLoaded == true {
                     VStack(alignment: .leading, spacing: 8) {
