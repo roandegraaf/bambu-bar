@@ -27,7 +27,7 @@ final class PrinterStore {
     static let shared = PrinterStore()
 
     private(set) var sessions: [PrinterSession] = []
-    private(set) var selectedSerial: String? { didSet { syncCamera(restart: true) } }
+    private(set) var selectedSerial: String? { didSet { syncCloud(restart: true) } }
     private(set) var history: [JobRecord] = []
     private(set) var discovered: [DiscoveredPrinter] = []
     /// Printers whose access code a slicer already knows (this Mac's Bambu Studio or OrcaSlicer, or a settings
@@ -38,16 +38,17 @@ final class PrinterStore {
     private(set) var toast: Toast?
     private(set) var isDemo = false
 
-    /// App-owned so navigation and window closure do not tear down the camera tunnel.
-    let cameraStream = CameraStream()
+    /// App-owned so navigation and window closure do not tear down the cloud session or camera tunnel.
+    let cloud = CloudAgent()
+    let cameraStream: CameraStream
     var cameraOn: Bool {
         didSet {
             defaults.set(cameraOn, forKey: "cameraOn")
-            syncCamera()
+            syncCloud()
         }
     }
-    @ObservationIgnored private var cameraStartTask: Task<Void, Never>?
-    @ObservationIgnored private var cameraRequest = 0
+    @ObservationIgnored private var cloudStartTask: Task<Void, Never>?
+    @ObservationIgnored private var cloudRequest = 0
 
     /// `nil` = automatic.
     var menuBarSerial: String? {
@@ -98,6 +99,7 @@ final class PrinterStore {
     }
 
     private init() {
+        cameraStream = CameraStream(agent: cloud)
         cameraOn = defaults.bool(forKey: "cameraOn")
         menuBarStyle = MenuBarStyle(rawValue: defaults.string(forKey: Keys.menuBarStyle) ?? "") ?? .both
         notifyFinished = defaults.object(forKey: Keys.notifyFinished) as? Bool ?? true
@@ -107,6 +109,11 @@ final class PrinterStore {
         confirmStop = defaults.object(forKey: Keys.confirmStop) as? Bool ?? true
         menuBarSerial = defaults.string(forKey: Keys.menuBarPrinter)
         selectedSerial = defaults.string(forKey: Keys.selected)
+        cloud.onAck = { [weak self] command, ok, reason in
+            guard let self, let serial = self.cloud.serial else { return }
+            self.session(serial)?.acknowledged(command, ok: ok, reason: reason)
+        }
+        cloud.onCommandsLost = { [weak self] problem in self?.showToast(problem.commandMessage, error: true) }
     }
 
     // MARK: - Lifecycle
@@ -143,45 +150,64 @@ final class PrinterStore {
         if selectedSerial == nil || session(selectedSerial!) == nil { selectedSerial = sessions.first?.id }
         discovery.start()
         reloadSlicerPrinters()
-        syncCamera()
+        syncCloud()
         writeSnapshot(force: true)
     }
 
     func stop() {
-        cancelCameraStart()
+        cancelCloudStart()
         cameraStream.stop()
+        cloud.stop()
         for session in sessions { session.stop() }
         discovery.stop()
     }
 
-    private func cancelCameraStart() {
-        cameraRequest += 1
-        cameraStartTask?.cancel()
-        cameraStartTask = nil
+    private func cancelCloudStart() {
+        cloudRequest += 1
+        cloudStartTask?.cancel()
+        cloudStartTask = nil
     }
 
-    /// Keep one camera for the selected printer, independent of view visibility.
-    func syncCamera(restart: Bool = false) {
-        guard cameraOn, !isDemo, let config else {
-            cancelCameraStart()
+    /// A printer on signed-command firmware takes job commands only through Bambu Cloud, so a session is kept
+    /// while its print runs, not just while the camera is on.
+    private func needsCloudControls(_ session: PrinterSession) -> Bool {
+        guard let status = session.status else { return false }
+        return status.controlsLocked && status.state.isActive
+    }
+
+    /// Keep one Bambu Cloud session for the selected printer while the camera or the controls need it,
+    /// independent of view visibility.
+    func syncCloud(restart: Bool = false) {
+        guard !isDemo, let current, cameraOn || needsCloudControls(current) else {
+            cancelCloudStart()
             cameraStream.stop()
+            cloud.stop()
             return
         }
-        if restart {
-            cancelCameraStart()
+        if restart || (cloud.serial != nil && cloud.serial != current.id) {
+            cancelCloudStart()
             cameraStream.stop()
-        } else {
-            guard cameraStartTask == nil, !cameraStream.isRunning else { return }
-            if case .failed = cameraStream.phase { return }
+            cloud.stop()
         }
-        cameraRequest += 1
-        let request = cameraRequest
-        cameraStartTask = Task { @MainActor [weak self] in
+        if cloud.serial == current.id { return syncCameraStream() }
+        guard cloudStartTask == nil else { return }
+        cloudRequest += 1
+        let request = cloudRequest
+        let serial = current.id
+        cloudStartTask = Task { @MainActor [weak self] in
             await BambuCloud.shared.refreshIfNeeded()
-            guard let self, !Task.isCancelled, self.cameraRequest == request,
-                  self.cameraOn, self.config?.serial == config.serial else { return }
-            self.cameraStartTask = nil
-            self.cameraStream.start(serial: config.serial, firmware: self.status?.firmware)
+            guard let self, !Task.isCancelled, self.cloudRequest == request, self.current?.id == serial else { return }
+            self.cloudStartTask = nil
+            self.cloud.start(serial: serial)
+            self.syncCameraStream()
+        }
+    }
+
+    private func syncCameraStream() {
+        if !cameraOn {
+            cameraStream.stop()
+        } else if !cameraStream.isActive {
+            cameraStream.start(firmware: status?.firmware)
         }
     }
 
@@ -208,12 +234,17 @@ final class PrinterStore {
     @discardableResult
     private func add(_ config: PrinterConfig) -> PrinterSession {
         let session = PrinterSession(config: config)
+        session.cloud = cloud
         session.onPhase = { [weak self] session, phase in
             // Reconnect attempts flip between offline and connecting; only settled states earn a widget reload.
             self?.writeSnapshot(force: phase == .online || phase == .unauthorized || phase == .idle)
         }
         session.onStatus = { [weak self] session, old, new, canceled in
             self?.trackJob(session, from: old, to: new, canceled: canceled)
+            if session.id == self?.current?.id,
+               old?.controlsLocked != new.controlsLocked || old?.state.isActive != new.state.isActive {
+                self?.syncCloud()
+            }
             self?.writeSnapshot(force: old?.state != new.state)
         }
         session.onAck = { [weak self] session, command, ok, reason in self?.acknowledged(session, ok: ok, reason: reason) }
@@ -392,14 +423,12 @@ final class PrinterStore {
 
     func pause() {
         guard let current, ensureControllable(current) else { return }
-        current.pause()
-        showToast("Pausing…")
+        sent(current.pause(), "Pausing…")
     }
 
     func resume() {
         guard let current, ensureControllable(current) else { return }
-        current.resume()
-        showToast("Resuming…")
+        sent(current.resume(), "Resuming…")
     }
 
     func stopPrint() {
@@ -416,30 +445,52 @@ final class PrinterStore {
             NSApp.activate(ignoringOtherApps: true)
             guard alert.runModal() == .alertFirstButtonReturn else { return }
         }
-        current.stopPrint()
-        showToast("Stopping…")
+        sent(current.stopPrint(), "Stopping…")
     }
 
     func toggleLight() { current?.toggleLight() }
 
     func setSpeed(_ level: SpeedLevel) {
         guard let current, ensureControllable(current) else { return }
-        current.setSpeed(level)
+        sent(current.setSpeed(level), nil)
     }
 
-    /// Print commands need the printer in Developer Mode; say so instead of sending something it will refuse.
+    /// Why pause, stop and speed changes can't reach the current printer right now, if they can't.
+    var controlBlocker: CloudAgent.Problem? {
+        guard !isDemo, let current, current.status?.controlsLocked == true else { return nil }
+        if let problem = CloudAgent.blocker(serial: current.id) { return problem }
+        if cloud.serial == current.id, cloud.phase == .failed(.rejected) { return .rejected }
+        return nil
+    }
+
+    /// A printer that refuses unsigned commands gets them over Bambu Cloud; make sure that session is for it.
     private func ensureControllable(_ session: PrinterSession) -> Bool {
-        if session.status?.controlsLocked == true {
-            showToast("Turn on LAN Only and Developer Mode on the printer to control prints from Bambu Bar.", error: true)
+        guard !isDemo, session.status?.controlsLocked == true else { return true }
+        if let problem = CloudAgent.blocker(serial: session.id) {
+            showToast(problem.commandMessage, error: true)
             return false
         }
+        if cloud.serial != session.id {
+            cancelCloudStart()
+            cameraStream.stop()
+            cloud.start(serial: session.id)
+            syncCameraStream()
+        }
         return true
+    }
+
+    private func sent(_ problem: CloudAgent.Problem?, _ progress: String?) {
+        if let problem {
+            showToast(problem.commandMessage, error: true)
+        } else if let progress {
+            showToast(progress)
+        }
     }
 
     private func acknowledged(_ session: PrinterSession, ok: Bool, reason: String?) {
         guard !ok else { return }
         let detail = (reason ?? "").lowercased().contains("verify")
-            ? "The printer only accepts commands in Developer Mode."
+            ? "The printer didn't accept the command's signature."
             : (reason.map { "The printer refused: \($0)" } ?? "The printer refused the command.")
         showToast(hasMultiplePrinters ? "\(session.config.name): \(detail)" : detail, error: true)
     }

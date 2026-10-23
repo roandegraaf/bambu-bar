@@ -62,14 +62,14 @@ Builds on the [Releases](https://github.com/rolottr/bambu-bar/releases) page are
 
 ### Controlling prints
 
-Reading status works in any mode. Pause, resume, stop and speed changes are accepted only when the printer is in **LAN Only** mode with **Developer Mode** on (printer screen → Settings → Network). That's Bambu Lab's rule for third-party apps; without it the printer refuses the command and Bambu Bar says so (the buttons show a lock). The chamber light works either way.
+Reading status and the chamber light work in any mode, over the local network (on H2 printers both chamber lights switch together). Since Bambu Lab's 2025 firmware, printers outside Developer Mode accept pause, resume, stop and speed changes only when they're signed the way Bambu's own apps sign them. For those printers Bambu Bar sends these commands through Bambu Cloud using the same helper and requirements as the [live camera](#live-camera): **Bambu Studio** installed and opened once, and your **Bambu account** signed in under Settings. Bambu Studio's network plugin does the signing. The session runs while a print is active (or the camera is on). If something is missing, the buttons show a lock and say what to do. Printers in LAN Only mode with Developer Mode on still take the commands directly over the local network.
 
 ## Live camera
 
 The printer page has a camera card. Press play once; the stream stays connected when you switch tabs or close the window, until you turn it off or quit Bambu Bar. Reopening the printer page reuses the live stream. If left enabled, it reconnects on the next app launch.
 
 - **Sign in** under Settings → Bambu account, with the account the printer is bound to (email with a password or an emailed code, plus a 2FA code if your account has one).
-- **Bambu Studio** must be installed and opened once, so it has downloaded its network plugin. Bambu Bar's `bambu-camera` helper loads that plugin (`~/Library/Application Support/BambuStudio/plugins`) to ask Bambu for the camera link and play the stream. It runs as its own process, so the plugin can't take the app down, and it's the only part of the app that loads code not signed by Bambu Bar.
+- **Bambu Studio** must be installed and opened once, so it has downloaded its network plugin. Bambu Bar's `bambu-camera` helper loads that plugin (`~/Library/Application Support/BambuStudio/plugins`) to ask Bambu for the camera link and play the stream; the same session carries signed print commands. It runs as its own process, so the plugin can't take the app down, and it's the only part of the app that loads code not signed by Bambu Bar.
 - The stream is the printer's own H.264 video, decoded by macOS. It stops when you leave the page, close the window or the Mac sleeps.
 - Most printers serve one remote viewer at a time: with the camera open in Bambu Studio or Bambu Handy, Bambu Bar says it's in use.
 
@@ -97,7 +97,7 @@ The widget shows what the app last saw, so keep Bambu Bar running (Open at Login
 | **P2S** | Development printer; verified with firmware **01.03.00.00** and an AMS 2 Pro. |
 | **X1, P1, A1, H2 families** | Same LAN protocol and certificate authorities; implemented, not verified on hardware. |
 
-The printer can be in cloud mode or LAN Only mode; controls need LAN Only with Developer Mode (see above). The live camera works in cloud mode (see [Live camera](#live-camera)).
+The printer can be in cloud mode or LAN Only mode; in cloud mode, controls go through Bambu Cloud (see [Controlling prints](#controlling-prints)). The live camera works in cloud mode (see [Live camera](#live-camera)).
 
 If you try another model, [open an issue](https://github.com/rolottr/bambu-bar/issues) with the model, firmware, macOS version and what worked. Run `--probe` (below) for a report; remove the serial number and access code before posting it.
 

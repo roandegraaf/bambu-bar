@@ -1,7 +1,7 @@
 import Foundation
 import Observation
 
-/// The Bambu Lab account, used only to open the printer's camera through Bambu's cloud.
+/// The Bambu Lab account, used to reach the printer through Bambu Cloud: its camera, and signed job commands.
 ///
 /// Sign-in is the REST flow Bambu Studio's login page uses: email with a password or an emailed code,
 /// then a 2FA code if the account has one. The session lives in the keychain and is refreshed in its
@@ -44,7 +44,7 @@ final class BambuCloud {
     private(set) var session: Session? {
         didSet {
             if oldValue?.accessToken != session?.accessToken {
-                PrinterStore.shared.syncCamera(restart: true)
+                PrinterStore.shared.syncCloud(restart: true)
             }
         }
     }

@@ -1,12 +1,17 @@
-// bambu-camera: plays a Bambu printer's cloud camera through Bambu Studio's own network plugin.
+// bambu-camera: one Bambu Cloud session for a printer through Bambu Studio's own network plugin.
 //
-// libbambu_networking mints the camera URL (it signs the request the way Studio does) and libBambuSource
-// opens the TUTK/Agora tunnel and hands back H.264 samples. Both are loaded from Bambu Studio's plugin
-// folder, so this runs in its own process: a crash or hang inside them never takes the app down.
+// libbambu_networking signs print commands and camera requests the way Studio does, so printers that
+// refuse unsigned commands still take them; libBambuSource opens the TUTK/Agora camera tunnel and hands
+// back H.264 samples. Both are loaded from Bambu Studio's plugin folder, so this runs in its own process:
+// a crash or hang inside them never takes the app down.
 //
-// stdin: "key=value" lines (the account token never goes on argv), then an empty line. EOF stops the stream.
+// stdin: "key=value" lines (the account token never goes on argv), then an empty line, then commands:
+//   "send <json>" publishes to the printer, "camera <firmware>" starts the camera, "nocamera" stops it.
+//   EOF ends the session.
 // stdout: frames of [type u8][length u32 BE][payload]:
-//   'S' status JSON   'I' stream info: width, height, fps, format_type, sub_type (i32 LE), format bytes
+//   'S' status JSON (session states, then "ready"; camera states are prefixed "camera:")
+//   'A' the printer's answer to a sent command: command, result, reason, sequence_id
+//   'I' stream info: width, height, fps, format_type, sub_type (i32 LE), format bytes
 //   'V' video sample: flags u8, decode_time u64 LE, data
 // Anything the plugins print goes to /dev/null. This tool's own log (never secrets) goes to log_file, or to
 // stderr with BAMBU_CAMERA_VERBOSE set; dump_file receives the raw H.264.
@@ -33,6 +38,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -356,9 +362,118 @@ int error_code(const std::string& answer)
     return parse_code(answer.substr(open + 1, answer.size() - open - 2));
 }
 
-enum class StreamEnd { failed, ended, gotSamples };
+struct Session {
+    Network net;
+    void* agent = nullptr;
+    std::string dev_id, net_version, cli_id, client_version;
+};
+Session g_session;
+Latch g_ready;
 
-StreamEnd play(const std::string& url)
+std::mutex g_sent_mutex;
+std::set<std::string> g_sent;
+
+struct CameraControl {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool wanted = false;
+    unsigned generation = 0;
+    std::string dev_ver;
+};
+CameraControl g_camera;
+
+bool camera_active(unsigned generation)
+{
+    std::lock_guard<std::mutex> lock(g_camera.mutex);
+    return g_camera.wanted && g_camera.generation == generation;
+}
+
+void camera_status(unsigned generation, const std::string& state, const std::string& detail = "")
+{
+    if (camera_active(generation)) status("camera:" + state, detail);
+}
+
+void camera_failed(unsigned generation, const std::string& reason, const std::string& detail)
+{
+    std::lock_guard<std::mutex> lock(g_camera.mutex);
+    if (!g_camera.wanted || g_camera.generation != generation) return;
+    g_camera.wanted = false;
+    status("camera:error:" + reason, detail);
+}
+
+std::string json_field(const std::string& body, const std::regex& pattern)
+{
+    std::smatch match;
+    return std::regex_search(body, match, pattern) ? match[1].str() : std::string();
+}
+
+void ack(const std::string& command, const std::string& result, const std::string& reason, const std::string& sequence)
+{
+    trace("ack command=%s result=%s reason=%s", command.c_str(), result.c_str(), reason.c_str());
+    frame('A', "{\"command\":\"" + escaped(command) + "\",\"result\":\"" + escaped(result) + "\",\"reason\":\"" + escaped(reason) +
+                   "\",\"sequence_id\":\"" + escaped(sequence) + "\"}");
+}
+
+// Reports carry the whole printer state; only acks for commands sent from here are forwarded, by sequence id.
+void cloud_message(const std::string& body)
+{
+    if (body.find("\"result\"") == std::string::npos) return;
+    static const std::regex sequence(R"re("sequence_id"\s*:\s*"([0-9]+)")re"), command(R"re("command"\s*:\s*"([a-z_]+)")re"),
+        result(R"re("result"\s*:\s*"([A-Za-z_]+)")re"), reason(R"re("reason"\s*:\s*"([^"]{0,120})")re");
+    const std::string id = json_field(body, sequence);
+    {
+        std::lock_guard<std::mutex> lock(g_sent_mutex);
+        if (id.empty() || g_sent.erase(id) == 0) return;
+    }
+    ack(json_field(body, command), json_field(body, result), json_field(body, reason), id);
+}
+
+void send_command(const std::string& json)
+{
+    static const std::regex sequence(R"re("sequence_id"\s*:\s*"([0-9]+)")re"), command(R"re("command"\s*:\s*"([a-z_]+)")re");
+    const std::string id = json_field(json, sequence), name = json_field(json, command);
+    if (!g_ready.wait(90s)) return ack(name, "failed", "Bambu Cloud didn't connect.", id);
+    if (!id.empty()) {
+        std::lock_guard<std::mutex> lock(g_sent_mutex);
+        g_sent.insert(id);
+    }
+    const int rc = g_session.net.send_message(g_session.agent, g_session.dev_id, json, 1, 0);
+    trace("send %s rc=%d", name.c_str(), rc);
+    if (rc != 0) {
+        {
+            std::lock_guard<std::mutex> lock(g_sent_mutex);
+            g_sent.erase(id);
+        }
+        ack(name, "failed", "Bambu Cloud didn't take the command (" + std::to_string(rc) + ").", id);
+    }
+}
+
+void want_camera(bool on, const std::string& dev_ver = "")
+{
+    {
+        std::lock_guard<std::mutex> lock(g_camera.mutex);
+        g_camera.wanted = on;
+        ++g_camera.generation;
+        if (on) g_camera.dev_ver = dev_ver;
+    }
+    g_camera.cv.notify_all();
+}
+
+// stdin after the settings: "send <json>", "camera <firmware>", "nocamera". EOF ends the session.
+void read_commands()
+{
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        if (line.rfind("send ", 0) == 0) std::thread(send_command, line.substr(5)).detach();
+        else if (line.rfind("camera", 0) == 0) want_camera(true, line.size() > 7 ? line.substr(7) : "");
+        else if (line == "nocamera") want_camera(false);
+    }
+    quit(0);
+}
+
+enum class StreamEnd { failed, ended, gotSamples, stopped };
+
+StreamEnd play(const std::string& url, unsigned generation)
 {
     Source& s = g_source;
     void* tunnel = nullptr;
@@ -367,23 +482,26 @@ StreamEnd play(const std::string& url)
         return StreamEnd::failed;
     }
     s.set_logger(tunnel, source_log, nullptr);
+    auto finish = [&](StreamEnd end, bool opened) {
+        if (opened) s.close(tunnel);
+        s.destroy(tunnel);
+        return end;
+    };
     int rc = s.open(tunnel);
     if (rc != Bambu_success && rc != Bambu_would_block) {
         trace("Bambu_Open rc=%d", rc);
-        s.destroy(tunnel);
-        return StreamEnd::failed;
+        return finish(StreamEnd::failed, false);
     }
     const auto deadline = std::chrono::steady_clock::now() + 20s;
     do {
+        if (!camera_active(generation)) return finish(StreamEnd::stopped, true);
         rc = s.start_stream(tunnel, true);
         if (rc != Bambu_would_block) break;
         std::this_thread::sleep_for(50ms);
     } while (std::chrono::steady_clock::now() < deadline);
     if (rc != Bambu_success) {
         trace("Bambu_StartStream rc=%d", rc);
-        s.close(tunnel);
-        s.destroy(tunnel);
-        return StreamEnd::failed;
+        return finish(StreamEnd::failed, true);
     }
 
     const int streams = s.get_stream_count(tunnel);
@@ -399,11 +517,12 @@ StreamEnd play(const std::string& url)
         frame('I', head, info.format_buffer, format_size);
         break;
     }
-    status("streaming");
+    camera_status(generation, "streaming");
 
     bool any = false;
     StreamEnd end = StreamEnd::failed;
     for (;;) {
+        if (!camera_active(generation)) return finish(StreamEnd::stopped, true);
         Bambu_Sample sample {};
         rc = s.read_sample(tunnel, &sample);
         if (rc == Bambu_would_block || rc == Bambu_buffer_limit) {
@@ -426,9 +545,70 @@ StreamEnd play(const std::string& url)
             std::fflush(g_dump);
         }
     }
-    s.close(tunnel);
-    s.destroy(tunnel);
-    return any ? StreamEnd::gotSamples : end;
+    return finish(any ? StreamEnd::gotSamples : end, true);
+}
+
+void run_camera(unsigned generation, const std::string& dev_ver)
+{
+    Session& session = g_session;
+    const std::string key = session.dev_id + "|" + dev_ver + "|\"tutk\",\"agora\"";
+    int failures = 0;
+    auto backoff = 2s;
+    auto pause = [&] {
+        for (auto waited = 0ms; waited < backoff && camera_active(generation); waited += 100ms) std::this_thread::sleep_for(100ms);
+        backoff = std::min(backoff * 2, std::chrono::seconds(30));
+    };
+    while (camera_active(generation)) {
+        camera_status(generation, "minting");
+        const std::string answer = mint(session.net, session.agent, key);
+        if (!camera_active(generation)) return;
+        if (answer.rfind("bambu:///", 0) != 0) {
+            const int code = error_code(answer);
+            trace("camera mint failed: attempt=%d code=%d empty=%s", failures + 1, code, answer.empty() ? "yes" : "no");
+            if (code == 1) return camera_failed(generation, "busy", "Another app is already watching this camera.");
+            if (g_unauthorized) fail("auth", "Bambu didn't accept the account sign-in.", 3);
+            if (++failures >= 4) {
+                return camera_failed(generation, "mint",
+                    answer.empty() ? "Bambu didn't hand out a camera link." : "Bambu refused the camera link (" + std::to_string(code) + ").");
+            }
+            pause();
+            continue;
+        }
+        std::string url = answer + "&device=" + session.dev_id + "&net_ver=" + session.net_version + "&dev_ver=" + dev_ver;
+        if (!session.cli_id.empty()) url += "&cli_id=" + session.cli_id;
+        url += "&cli_ver=" + session.client_version;
+
+        camera_status(generation, "opening");
+        switch (play(url, generation)) {
+        case StreamEnd::stopped:
+            return;
+        case StreamEnd::gotSamples:
+            failures = 0;
+            backoff = 2s;
+            break;
+        case StreamEnd::ended:
+        case StreamEnd::failed:
+            if (++failures >= 4) return camera_failed(generation, "stream", "The camera stream didn't start.");
+            pause();
+            break;
+        }
+    }
+}
+
+void camera_worker()
+{
+    if (g_source.init) g_source.init();
+    for (;;) {
+        unsigned generation;
+        std::string dev_ver;
+        {
+            std::unique_lock<std::mutex> lock(g_camera.mutex);
+            g_camera.cv.wait(lock, [] { return g_camera.wanted; });
+            generation = g_camera.generation;
+            dev_ver = g_camera.dev_ver;
+        }
+        run_camera(generation, dev_ver);
+    }
 }
 
 } // namespace
@@ -455,20 +635,16 @@ int main()
         if (fd >= 0) g_dump = ::fdopen(fd, "wb");
     }
     const std::string plugin_dir = get("plugin_dir"), data_dir = get("data_dir"), cert_dir = get("cert_dir");
-    const std::string dev_id = get("dev_id"), dev_ver = get("dev_ver"), user_info = get("user_info");
+    const std::string dev_id = get("dev_id"), user_info = get("user_info");
     const std::string client_version = get("client_version"), country = get("country").empty() ? "US" : get("country");
     const std::string cli_id = get("cli_id");
     if (plugin_dir.empty() || data_dir.empty() || dev_id.empty() || user_info.empty())
         fail("config", "Missing settings.", 64);
 
-    std::thread([] {
-        char buffer[256];
-        while (::read(STDIN_FILENO, buffer, sizeof buffer) > 0) {}
-        quit(0);
-    }).detach();
+    std::thread(read_commands).detach();
 
     status("loading");
-    Network n;
+    Network& n = g_session.net;
     const char* signature_source = std::getenv("CAMERA_SIGNATURE_SOURCE");
     // The plugin reserves Executable-info and derives it internally. Use its own real
     // signature by default; CAMERA_SIGNATURE_SOURCE=host is an opt-out for diagnostics.
@@ -498,7 +674,7 @@ int main()
     });
     n.set_get_country_code_fn(agent, [country] { return country; });
     n.set_on_subscribe_failure_fn(agent, [](std::string) { trace("subscribe failed"); });
-    n.set_on_message_fn(agent, [](std::string, std::string) {});
+    n.set_on_message_fn(agent, [](std::string, std::string body) { cloud_message(body); });
     n.set_on_user_message_fn(agent, [](std::string, std::string) {});
     n.set_on_local_connect_fn(agent, [](int, std::string, std::string) {});
     n.set_on_local_message_fn(agent, [](std::string, std::string) {});
@@ -553,6 +729,7 @@ int main()
     if (n.enable_multi_machine) n.enable_multi_machine(agent, true);
     n.connect_server(agent);
     if (!server_connected.wait(15s)) trace("cloud MQTT not confirmed after 15 s");
+    if (g_unauthorized) fail("auth", "Bambu didn't accept the account sign-in.", 3);
     n.add_subscribe(agent, {dev_id});
     if (n.set_user_selected_machine) n.set_user_selected_machine(agent, dev_id);
     std::this_thread::sleep_for(1s);
@@ -563,9 +740,9 @@ int main()
          })
         n.send_message(agent, dev_id, message, 0, 0);
 
-    // Studio repeats these every second for the selected printer; the URL mint waits until the
-    // device certificate is installed for this session.
-    std::thread([&n, agent, dev_id] {
+    // Studio repeats these every second for the selected printer; signed commands and the camera
+    // mint both wait until the device certificate is installed for this session.
+    std::thread([agent, dev_id] {
         for (;;) {
             if (n.refresh_connection) n.refresh_connection(agent);
             if (n.install_device_cert) n.install_device_cert(agent, dev_id, false);
@@ -574,41 +751,12 @@ int main()
     }).detach();
     std::this_thread::sleep_for(3s);
 
-    if (g_source.init) g_source.init();
-    const std::string key = dev_id + "|" + dev_ver + "|\"tutk\",\"agora\"";
-    int failures = 0;
-    auto backoff = 2s;
-    for (;;) {
-        status("minting");
-        const std::string answer = mint(n, agent, key);
-        if (answer.rfind("bambu:///", 0) != 0) {
-            const int code = error_code(answer);
-            trace("camera mint failed: attempt=%d code=%d empty=%s", failures + 1, code, answer.empty() ? "yes" : "no");
-            if (code == 1) fail("busy", "Another app is already watching this camera.", 5);
-            if (g_unauthorized) fail("auth", "Bambu didn't accept the account sign-in.", 3);
-            if (++failures >= 4) {
-                fail("mint", answer.empty() ? "Bambu didn't hand out a camera link." : "Bambu refused the camera link (" + std::to_string(code) + ").", 6);
-            }
-            std::this_thread::sleep_for(backoff);
-            backoff = std::min(backoff * 2, std::chrono::seconds(30));
-            continue;
-        }
-        std::string url = answer + "&device=" + dev_id + "&net_ver=" + net_version + "&dev_ver=" + dev_ver;
-        if (!cli_id.empty()) url += "&cli_id=" + cli_id;
-        url += "&cli_ver=" + client_version;
-
-        status("opening");
-        switch (play(url)) {
-        case StreamEnd::gotSamples:
-            failures = 0;
-            backoff = 2s;
-            break;
-        case StreamEnd::ended:
-        case StreamEnd::failed:
-            if (++failures >= 4) fail("stream", "The camera stream didn't start.", 7);
-            std::this_thread::sleep_for(backoff);
-            backoff = std::min(backoff * 2, std::chrono::seconds(30));
-            break;
-        }
-    }
+    g_session.agent = agent;
+    g_session.dev_id = dev_id;
+    g_session.net_version = net_version;
+    g_session.cli_id = cli_id;
+    g_session.client_version = client_version;
+    status("ready");
+    g_ready.signal();
+    camera_worker();
 }

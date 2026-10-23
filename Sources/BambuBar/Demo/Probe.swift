@@ -54,6 +54,12 @@ enum Probe {
             "light \(s.chamberLightOn.map { $0 ? "on" : "off" } ?? "-") door \(s.doorOpen.map { $0 ? "open" : "closed" } ?? "-") wifi \(s.wifiSignal ?? 0) dBm",
             "controls locked: \(s.controlsLocked)  firmware \(s.firmware ?? "-")  nozzle \(s.nozzleDiameter ?? 0) \(s.nozzleType ?? "-")",
         ]
+        for e in s.extruders {
+            lines.append("extruder \(e.id) (\(e.side))\(e.isActive ? " active" : ""): \(e.temperature.current)/\(e.temperature.target) nozzle \(e.nozzle?.diameter ?? 0) \(e.nozzle?.type ?? "-")")
+        }
+        if !s.rackNozzles.isEmpty {
+            lines.append("rack: " + s.rackNozzles.map { "0x\(String($0.id, radix: 16)) \($0.diameter ?? 0) \($0.type ?? "-")" }.joined(separator: ", "))
+        }
         for unit in s.ams {
             let spools = unit.spools.map { "\($0.label) \($0.isLoaded ? "\($0.material) #\($0.color.prefix(6)) \($0.remainText)" : "empty")" }
             lines.append("\(unit.title) \(unit.humidity.map { "\($0)%RH" } ?? "") \(unit.temperature.map { "\($0)°" } ?? ""): " + spools.joined(separator: ", "))

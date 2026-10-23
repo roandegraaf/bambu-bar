@@ -141,7 +141,7 @@ struct SettingsPage: View {
 
             group("Controls", symbol: "slider.horizontal.3") {
                 toggle("Ask before stopping a print", isOn: $store.confirmStop)
-                Text("Pause, stop and speed changes need **LAN Only** mode with **Developer Mode** on the printer (Settings → Network on its screen). Reading status and the chamber light work in any mode.")
+                Text("Printers that only take signed commands get pause, stop and speed changes through Bambu Cloud, signed by Bambu Studio's network plugin, so they need Bambu Studio installed and the Bambu account below. Status and the chamber light always go over the local network.")
                     .font(.system(size: 11.5)).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }

@@ -15,6 +15,9 @@ struct MenuPanel: View {
                 if let issue = status.mostSevereIssue, issue.severity <= .common {
                     IssueBanner(issue: issue)
                 }
+                if showsCamera {
+                    CameraCard(compact: true, width: Self.contentWidth)
+                }
                 temperatures(status)
                 if !status.ams.isEmpty || status.externalSpool?.isLoaded == true {
                     FilamentStrip(status: status)
@@ -24,6 +27,9 @@ struct MenuPanel: View {
                 }
             } else {
                 ConnectionCard()
+                if showsCamera {
+                    CameraCard(compact: true, width: Self.contentWidth)
+                }
             }
             if let toast = store.toast {
                 ToastView(toast: toast)
@@ -31,13 +37,14 @@ struct MenuPanel: View {
             }
             footer
         }
-        .padding(12)
-        .frame(width: 372)
+        .padding(Self.padding)
+        .frame(width: Self.width)
         // The menu bar window is clear glass; frost it so text stays legible over busy windows.
         .background(plainPanel ? AnyShapeStyle(Color.clear) : AnyShapeStyle(.regularMaterial))
         .animation(.smooth(duration: 0.3), value: store.toast)
         .animation(.smooth(duration: 0.3), value: store.status?.state)
         .animation(.smooth(duration: 0.25), value: store.selectedSerial)
+        .animation(.smooth(duration: 0.3), value: store.cameraOn)
         // Opening the panel shows the printer the menu bar is showing.
         .onAppear { if let serial = store.menuBarSession?.id { store.select(serial) } }
     }
@@ -69,6 +76,13 @@ struct MenuPanel: View {
                 }
             }
             Spacer(minLength: 8)
+            if store.isConfigured && !store.isDemo {
+                Button { store.cameraOn.toggle() } label: {
+                    Image(systemName: store.cameraOn ? "video.fill" : "video")
+                }
+                .buttonStyle(HeaderIconStyle())
+                .help(store.cameraOn ? "Turn the camera off" : "Show the live camera")
+            }
             if store.isConfigured {
                 RefreshControl(compact: true)
             }
@@ -79,6 +93,12 @@ struct MenuPanel: View {
         .padding(.horizontal, 4)
         .padding(.top, 2)
     }
+
+    private static let width: CGFloat = 372
+    private static let padding: CGFloat = 12
+    private static let contentWidth = width - padding * 2
+
+    private var showsCamera: Bool { store.cameraOn && !store.isDemo }
 
     private var linkColor: Color {
         switch store.phase {
@@ -102,7 +122,7 @@ struct MenuPanel: View {
 
     private func temperatures(_ s: PrinterStatus) -> some View {
         HStack(spacing: 8) {
-            TemperatureTile(title: "Nozzle", symbol: "flame.fill", temperature: s.nozzle, tint: Palette.nozzle, maxValue: 300)
+            NozzleTiles(status: s)
             TemperatureTile(title: "Bed", symbol: "heat.waves", temperature: s.bed, tint: Palette.bed, maxValue: 110)
             TemperatureTile(title: "Chamber", symbol: "thermometer.medium", temperature: nil, plain: s.chamber, tint: Palette.chamber, maxValue: 65)
         }
@@ -429,11 +449,9 @@ struct PrintControls: View {
     var status: PrinterStatus
     @Environment(PrinterStore.self) private var store
 
-    /// The printer only takes print commands in LAN Only mode with Developer Mode on.
-    private var locked: Bool { status.controlsLocked }
-    private var lockedHelp: String? {
-        locked ? "The printer accepts this only in LAN Only mode with Developer Mode on (Settings → Network on its screen)." : nil
-    }
+    /// The printer only takes signed commands, and Bambu Bar can't send them through Bambu Cloud right now.
+    private var locked: Bool { status.controlsLocked && store.controlBlocker != nil }
+    private var lockedHelp: String? { locked ? store.controlBlocker?.commandMessage : nil }
 
     var body: some View {
         HStack(spacing: 8) {

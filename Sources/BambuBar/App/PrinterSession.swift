@@ -26,6 +26,8 @@ final class PrinterSession: Identifiable {
     var onAck: ((PrinterSession, String, Bool, String?) -> Void)?
     var onHeartbeat: ((PrinterSession) -> Void)?
 
+    /// The Bambu Cloud session, for printers that only take signed job commands.
+    @ObservationIgnored weak var cloud: CloudAgent?
     @ObservationIgnored private let connection = PrinterConnection()
     @ObservationIgnored private var demo: DemoDriver?
     @ObservationIgnored private var insecure = false
@@ -36,11 +38,7 @@ final class PrinterSession: Identifiable {
         self.config = config
         connection.onPhase = { [weak self] phase in self?.phaseChanged(phase) }
         connection.onStatus = { [weak self] status, doc in self?.received(status, canceled: ReportParser.wasCanceled(doc)) }
-        connection.onAck = { [weak self] command, ok, reason in
-            guard let self else { return }
-            if !ok { self.pendingLight = nil; self.pendingSpeed = nil }
-            self.onAck?(self, command, ok, reason)
-        }
+        connection.onAck = { [weak self] command, ok, reason in self?.acknowledged(command, ok: ok, reason: reason) }
         connection.onHeartbeat = { [weak self] in
             guard let self else { return }
             // Whole seconds are enough for the label and spare the UI an update per message.
@@ -122,27 +120,58 @@ final class PrinterSession: Identifiable {
 
     // MARK: - Commands
 
-    func pause() { if let demo { demo.pause() } else { connection.pause() } }
-    func resume() { if let demo { demo.resume() } else { connection.resume() } }
-    func stopPrint() { if let demo { demo.stop() } else { connection.stopPrint() } }
+    @discardableResult
+    func pause() -> CloudAgent.Problem? { if let demo { demo.pause(); return nil } else { return send(.pause) } }
+    @discardableResult
+    func resume() -> CloudAgent.Problem? { if let demo { demo.resume(); return nil } else { return send(.resume) } }
+    @discardableResult
+    func stopPrint() -> CloudAgent.Problem? { if let demo { demo.stop(); return nil } else { return send(.stop) } }
 
+    /// The light isn't signature-gated, so it always goes over the local network; every chamber light node switches together.
     func toggleLight() {
         let on = !chamberLightOn
         pendingLight = on
-        if let demo { demo.setLight(on) } else { connection.setChamberLight(on) }
+        if let demo {
+            demo.setLight(on)
+        } else {
+            for node in status?.chamberLightNodes ?? ["chamber_light"] { connection.send(.light(node: node, on: on)) }
+        }
         clearPendingSoon()
     }
 
-    func setSpeed(_ level: SpeedLevel) {
+    @discardableResult
+    func setSpeed(_ level: SpeedLevel) -> CloudAgent.Problem? {
+        if let demo {
+            demo.setSpeed(level)
+        } else if let problem = send(.speed(level)) {
+            return problem
+        }
         pendingSpeed = level
-        if let demo { demo.setSpeed(level) } else { connection.setSpeed(level) }
         clearPendingSoon()
+        return nil
     }
 
+    /// A printer that refuses unsigned job commands gets them through Bambu Cloud, signed by Bambu's plugin.
+    private func send(_ command: PrinterCommand) -> CloudAgent.Problem? {
+        guard status?.controlsLocked == true else {
+            connection.send(command)
+            return nil
+        }
+        guard let cloud, cloud.serial == id else { return .unavailable("Bambu Cloud isn't connected to this printer.") }
+        return cloud.send(command)
+    }
+
+    func acknowledged(_ command: String, ok: Bool, reason: String?) {
+        if !ok { pendingLight = nil; pendingSpeed = nil }
+        onAck?(self, command, ok, reason)
+    }
+
+    /// A command over Bambu Cloud may wait for the session to sign in first, so it gets longer to show up.
     private func clearPendingSoon() {
+        let wait: Duration = status?.controlsLocked == true ? .seconds(25) : .seconds(6)
         pendingTask?.cancel()
         pendingTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(6))
+            try? await Task.sleep(for: wait)
             guard !Task.isCancelled else { return }
             self?.pendingLight = nil
             self?.pendingSpeed = nil

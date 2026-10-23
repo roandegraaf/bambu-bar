@@ -3,25 +3,35 @@ import SwiftUI
 
 /// Displays the app-owned camera session; leaving this view keeps the stream connected.
 struct CameraCard: View {
+    var compact = false
+    var width: CGFloat?
     @Environment(PrinterStore.self) private var store
     private var cameraOn: Bool { store.cameraOn }
     private var stream: CameraStream { store.cameraStream }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            SectionLabel("Camera", trailing: trailing)
+            if !compact {
+                SectionLabel("Camera", trailing: trailing)
+            }
             ZStack {
                 Color.black
                 if cameraOn {
-                    CameraLayerView(layer: stream.layer)
+                    CameraLayerView(screens: stream.screens)
                         .opacity(stream.phase == .live ? 1 : 0)
                 }
                 overlay
             }
             .aspectRatio(aspect, contentMode: .fit)
+            .frame(width: width, height: width.map { $0 / aspect })
             .frame(maxWidth: .infinity)
-            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Color.primary.opacity(0.10), lineWidth: 0.75))
+            .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: radius, style: .continuous).strokeBorder(Color.primary.opacity(0.10), lineWidth: 0.75))
+            .overlay(alignment: .topLeading) {
+                if compact && cameraOn && stream.phase == .live {
+                    LiveBadge().padding(10)
+                }
+            }
             .overlay(alignment: .topTrailing) {
                 if cameraOn && stream.phase == .live {
                     Button { store.cameraOn = false } label: { Image(systemName: "stop.fill") }
@@ -32,8 +42,10 @@ struct CameraCard: View {
             }
             .environment(\.colorScheme, .dark)
         }
-        .onAppear { store.syncCamera() }
+        .onAppear { store.syncCloud() }
     }
+
+    private var radius: CGFloat { compact ? 18 : 16 }
 
     private var aspect: CGFloat {
         guard let size = stream.videoSize, size.height > 0 else { return 16 / 9 }
@@ -75,13 +87,16 @@ struct CameraCard: View {
 
     private func failure(_ problem: CameraStream.Problem) -> some View {
         let (symbol, title, detail) = describe(problem)
-        return VStack(spacing: 8) {
-            Image(systemName: symbol).font(.system(size: 22)).foregroundStyle(.white.opacity(0.55))
-            Text(title).font(.system(size: 13, weight: .semibold)).foregroundStyle(.white.opacity(0.9))
-            Text(detail).font(.system(size: 11.5)).foregroundStyle(.white.opacity(0.6))
+        return VStack(spacing: compact ? 6 : 8) {
+            if !compact {
+                Image(systemName: symbol).font(.system(size: 22)).foregroundStyle(.white.opacity(0.55))
+            }
+            Text(title).font(.system(size: compact ? 12.5 : 13, weight: .semibold)).foregroundStyle(.white.opacity(0.9))
+            Text(detail).font(.system(size: compact ? 10.5 : 11.5)).foregroundStyle(.white.opacity(0.6))
                 .multilineTextAlignment(.center)
+                .lineLimit(compact ? 3 : nil)
                 .frame(maxWidth: 380)
-                .fixedSize(horizontal: false, vertical: true)
+                .fixedSize(horizontal: false, vertical: !compact)
             HStack(spacing: 8) {
                 switch problem {
                 case .signedOut, .rejected:
@@ -89,14 +104,14 @@ struct CameraCard: View {
                 case .needsStudio:
                     Button("Get Bambu Studio") { NSWorkspace.shared.open(URL(string: "https://bambulab.com/en/download/studio")!) }
                 default:
-                    Button("Try Again") { store.syncCamera(restart: true) }
+                    Button("Try Again") { store.syncCloud(restart: true) }
                 }
                 Button("Turn Off") { store.cameraOn = false }
             }
             .controlSize(.small)
-            .padding(.top, 4)
+            .padding(.top, compact ? 2 : 4)
         }
-        .padding(20)
+        .padding(compact ? 14 : 20)
     }
 
     private func describe(_ problem: CameraStream.Problem) -> (String, String, String) {
@@ -120,23 +135,37 @@ struct CameraCard: View {
             return ("video.slash", "The camera didn't open", reason)
         }
     }
-
-
 }
 
 private struct CameraLayerView: NSViewRepresentable {
-    let layer: AVSampleBufferDisplayLayer
+    let screens: CameraScreens
 
-    func makeNSView(context: Context) -> NSView {
-        let view = LayerHost()
-        view.wantsLayer = true
-        view.layer?.addSublayer(layer)
-        return view
+    func makeNSView(context: Context) -> LayerHost {
+        LayerHost(screens: screens)
     }
 
-    func updateNSView(_ view: NSView, context: Context) {}
+    func updateNSView(_ view: LayerHost, context: Context) {}
 
-    private final class LayerHost: NSView {
+    static func dismantleNSView(_ view: LayerHost, coordinator: ()) {
+        view.screens.detach(view.display)
+    }
+
+    final class LayerHost: NSView {
+        let screens: CameraScreens
+        let display = AVSampleBufferDisplayLayer()
+
+        init(screens: CameraScreens) {
+            self.screens = screens
+            super.init(frame: .zero)
+            wantsLayer = true
+            display.videoGravity = .resizeAspect
+            display.backgroundColor = NSColor.black.cgColor
+            layer?.addSublayer(display)
+            screens.attach(display)
+        }
+
+        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
         override func layout() {
             super.layout()
             CATransaction.begin()
@@ -165,5 +194,18 @@ private struct CameraChipStyle: ButtonStyle {
             .frame(width: 26, height: 26)
             .background(Circle().fill(.black.opacity(configuration.isPressed ? 0.7 : 0.5)))
             .contentShape(Circle())
+    }
+}
+
+private struct LiveBadge: View {
+    var body: some View {
+        HStack(spacing: 4) {
+            Circle().fill(Color.red).frame(width: 6, height: 6)
+            Text("Live").font(.system(size: 10, weight: .semibold))
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 4)
+        .background(Capsule().fill(.black.opacity(0.5)))
     }
 }

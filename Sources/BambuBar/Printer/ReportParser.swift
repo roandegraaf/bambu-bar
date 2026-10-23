@@ -44,14 +44,15 @@ struct ReportDocument {
     }
 
     /// Recursive merge. Arrays of objects carrying an `id` (or, for `lights_report`, a `node`) merge entry by
-    /// entry; other arrays are replaced.
+    /// entry; other arrays are replaced. The `device` extruder and nozzle `info` lists always arrive whole, so a
+    /// hotend taken off the H2C rack has to disappear rather than linger.
     static func merge(_ base: [String: Any], _ delta: [String: Any]) -> [String: Any] {
         var out = base
         for (key, new) in delta {
             let idKey = key == "lights_report" ? "node" : "id"
             if let newDict = new as? [String: Any], let oldDict = out[key] as? [String: Any] {
                 out[key] = merge(oldDict, newDict)
-            } else if let newArray = new as? [[String: Any]], let oldArray = out[key] as? [[String: Any]],
+            } else if key != "info", let newArray = new as? [[String: Any]], let oldArray = out[key] as? [[String: Any]],
                       !newArray.isEmpty, newArray.allSatisfy({ $0[idKey] != nil }) {
                 var merged = oldArray
                 for item in newArray {
@@ -89,9 +90,9 @@ enum ReportParser {
 
         // Temperatures: the newer `device` block packs current (low 16 bits) and target (high 16 bits).
         let device = p["device"] as? [String: Any]
-        let extruders = (device?["extruder"] as? [String: Any])?["info"] as? [[String: Any]]
-        if let packed = int(extruders?.first?["temp"]) {
-            s.nozzle = unpack(packed)
+        parseExtruders(device, into: &s)
+        if let active = s.activeExtruder {
+            s.nozzle = active.temperature
         } else {
             s.nozzle = Temperature(current: double(p["nozzle_temper"]) ?? 0, target: double(p["nozzle_target_temper"]) ?? 0)
         }
@@ -128,9 +129,12 @@ enum ReportParser {
         s.heatbreakFan = fan(p["heatbreak_fan_speed"])
 
         s.speed = SpeedLevel(rawValue: int(p["spd_lvl"]) ?? 2) ?? .standard
-        if let lights = p["lights_report"] as? [[String: Any]],
-           let chamber = lights.first(where: { string($0["node"]) == "chamber_light" }) {
-            s.chamberLightOn = string(chamber["mode"]) != "off"
+        if let lights = p["lights_report"] as? [[String: Any]] {
+            let chamber = lights.filter { string($0["node"])?.hasPrefix("chamber_light") == true }
+            if !chamber.isEmpty {
+                s.chamberLightOn = chamber.contains { string($0["mode"]) != "off" }
+                s.chamberLightNodes = chamber.compactMap { string($0["node"]) }
+            }
         }
         if let stat = string(p["stat"]), let bits = UInt64(stat, radix: 16) {
             s.doorOpen = bits & 0x0080_0000 != 0
@@ -146,9 +150,9 @@ enum ReportParser {
         if let ipcam = p["ipcam"] as? [String: Any], let url = string(ipcam["rtsp_url"]) {
             s.liveViewEnabled = url != "disable" && !url.isEmpty
         }
-        if let nozzles = (device?["nozzle"] as? [String: Any])?["info"] as? [[String: Any]], let n = nozzles.first {
-            s.nozzleDiameter = double(n["diameter"])
-            s.nozzleType = string(n["type"])
+        if let n = s.activeExtruder?.nozzle {
+            s.nozzleDiameter = n.diameter
+            s.nozzleType = n.type
         } else {
             s.nozzleDiameter = double(p["nozzle_diameter"])
             s.nozzleType = string(p["nozzle_type"])
@@ -162,6 +166,26 @@ enum ReportParser {
         s.issues = issues(p, hms: hms, state: s.state)
         s.canceled = s.state == .failed && wasCanceled(doc)
         return s
+    }
+
+    // MARK: - Extruders
+
+    /// `extruder.state` packs the extruder count in bits 0-3 and the active extruder in bits 4-7. Nozzle ids below
+    /// 0x10 are the hotends mounted on the extruder with that id; 0x10 and up sit in the H2C rack.
+    private static func parseExtruders(_ device: [String: Any]?, into s: inout PrinterStatus) {
+        let root = device?["extruder"] as? [String: Any]
+        let entries = (root?["info"] as? [[String: Any]]) ?? []
+        let nozzles = (((device?["nozzle"] as? [String: Any])?["info"] as? [[String: Any]]) ?? []).compactMap { n -> NozzleInfo? in
+            guard let id = int(n["id"]) else { return nil }
+            return NozzleInfo(id: id, diameter: double(n["diameter"]), type: string(n["type"]).flatMap { $0.isEmpty ? nil : $0 })
+        }
+        let activeID = entries.count > 1 ? int(root?["state"]).map { ($0 >> 4) & 0xF } : nil
+        s.extruders = entries.compactMap { e -> Extruder? in
+            guard let id = int(e["id"]), let packed = int(e["temp"]) else { return nil }
+            return Extruder(id: id, temperature: unpack(packed), nozzle: nozzles.first { $0.id == id },
+                            isActive: activeID.map { $0 == id } ?? true)
+        }.sorted { $0.id > $1.id }
+        s.rackNozzles = nozzles.filter { $0.id >= 0x10 }.sorted { $0.id < $1.id }
     }
 
     // MARK: - Filament
@@ -204,8 +228,9 @@ enum ReportParser {
         }
 
         // Active slot: the extruder's `snow` (unit << 8 | slot) on newer firmware, else `tray_now`.
-        let extruders = (device?["extruder"] as? [String: Any])?["info"] as? [[String: Any]]
-        if let snow = int(extruders?.first?["snow"]), snow != 0xFFFF {
+        let extruders = ((device?["extruder"] as? [String: Any])?["info"] as? [[String: Any]]) ?? []
+        let activeEntry = extruders.first { int($0["id"]) == s.activeExtruder?.id } ?? extruders.first
+        if let snow = int(activeEntry?["snow"]), snow != 0xFFFF {
             let unit = snow >> 8, slot = snow & 0xFF
             if unit == 254 || unit == 255 {
                 s.activeSpoolID = slot == 255 ? nil : Spool.externalID

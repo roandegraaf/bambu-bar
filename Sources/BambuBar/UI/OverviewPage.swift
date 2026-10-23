@@ -14,8 +14,8 @@ struct OverviewPage: View {
                 if status.state.isActive {
                     PrintControls(status: status)
                         .frame(maxWidth: 520)
-                    if status.controlsLocked {
-                        lockedNote
+                    if let blocker = store.controlBlocker {
+                        lockedNote(blocker)
                     }
                 }
                 ForEach(status.issues) { IssueBanner(issue: $0) }
@@ -41,10 +41,10 @@ struct OverviewPage: View {
         return parts.joined(separator: " · ")
     }
 
-    private var lockedNote: some View {
+    private func lockedNote(_ blocker: CloudAgent.Problem) -> some View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: "lock.fill").foregroundStyle(.secondary)
-            Text("The printer only accepts pause, stop and speed changes from apps in **LAN Only** mode with **Developer Mode** on (printer screen → Settings → Network). Status and the chamber light work either way.")
+            Text(blocker.commandMessage + " Status and the chamber light work either way.")
                 .font(.system(size: 11.5))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -57,7 +57,7 @@ struct OverviewPage: View {
             SectionLabel("Temperatures & airflow")
             Grid(horizontalSpacing: 10, verticalSpacing: 10) {
                 GridRow {
-                    TemperatureTile(title: "Nozzle", symbol: "flame.fill", temperature: s.nozzle, tint: Palette.nozzle, maxValue: 300)
+                    NozzleTiles(status: s)
                     TemperatureTile(title: "Bed", symbol: "heat.waves", temperature: s.bed, tint: Palette.bed, maxValue: 110)
                     TemperatureTile(title: "Chamber", symbol: "thermometer.medium", temperature: nil, plain: s.chamber, tint: Palette.chamber, maxValue: 65)
                     FanTile(status: s)
@@ -72,7 +72,16 @@ struct OverviewPage: View {
             HStack(alignment: .top, spacing: 10) {
                 VStack(spacing: 9) {
                     DetailRow(title: "Speed", value: "\(store.speed.title) (\(store.speed.percent)%)", symbol: "speedometer")
-                    DetailRow(title: "Nozzle", value: nozzleText(s), symbol: "pencil.tip")
+                    if s.hasMultipleExtruders {
+                        ForEach(s.extruders) { e in
+                            DetailRow(title: "\(e.side) nozzle", value: nozzleText(e.nozzle?.diameter, e.nozzle?.type), symbol: "pencil.tip")
+                        }
+                    } else {
+                        DetailRow(title: "Nozzle", value: nozzleText(s.nozzleDiameter, s.nozzleType), symbol: "pencil.tip")
+                    }
+                    if !s.rackNozzles.isEmpty {
+                        DetailRow(title: "Nozzle rack", value: rackText(s.rackNozzles), symbol: "square.grid.3x2")
+                    }
                     DetailRow(title: "Door", value: s.doorOpen.map { $0 ? "Open" : "Closed" } ?? "—", symbol: "door.left.hand.closed")
                     DetailRow(title: "Chamber light", value: store.chamberLightOn ? "On" : "Off", symbol: "lightbulb")
                 }
@@ -88,11 +97,18 @@ struct OverviewPage: View {
         }
     }
 
-    private func nozzleText(_ s: PrinterStatus) -> String {
+    private func nozzleText(_ diameter: Double?, _ type: String?) -> String {
         var parts: [String] = []
-        if let d = s.nozzleDiameter { parts.append(String(format: "%.1f mm", d)) }
-        if let t = s.nozzleType { parts.append(NozzleType.describe(t)) }
+        if let diameter { parts.append(String(format: "%.1f mm", diameter)) }
+        if let type { parts.append(NozzleType.describe(type)) }
         return parts.isEmpty ? "—" : parts.joined(separator: " · ")
+    }
+
+    /// "3 spare · 0.4, 0.4, 0.6 mm"
+    private func rackText(_ nozzles: [NozzleInfo]) -> String {
+        let sizes = nozzles.compactMap(\.diameter).map { String(format: "%.1f", $0) }
+        let count = "\(nozzles.count) spare"
+        return sizes.isEmpty ? count : "\(count) · \(sizes.joined(separator: ", ")) mm"
     }
 }
 

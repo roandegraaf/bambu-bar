@@ -3,32 +3,12 @@ import AVFoundation
 import CoreMedia
 import Foundation
 import Observation
+import VideoToolbox
 
-/// Bambu Studio on this Mac: its network plugins open the camera, so the camera needs it installed and run once.
-struct BambuStudioInstall {
-    var pluginFolder: URL
-    var certFolder: URL
-    var version: String
-
-    static func find() -> BambuStudioInstall? {
-        let plugins = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/BambuStudio/plugins")
-        guard ["libbambu_networking.dylib", "libBambuSource.dylib"].allSatisfy({
-            FileManager.default.fileExists(atPath: plugins.appendingPathComponent($0).path)
-        }) else { return nil }
-        let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.bambulab.bambu-studio")
-            ?? URL(fileURLWithPath: "/Applications/BambuStudio.app")
-        let certs = app.appendingPathComponent("Contents/Resources/cert")
-        guard FileManager.default.fileExists(atPath: certs.appendingPathComponent("slicer_base64.cer").path) else { return nil }
-        let version = Bundle(url: app)?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "02.08.04.57"
-        return BambuStudioInstall(pluginFolder: plugins, certFolder: certs, version: version)
-    }
-}
-
-/// The printer's live camera over Bambu's cloud, like Bambu Studio and Bambu Handy show it.
+/// The printer's live camera over Bambu Cloud, like Bambu Studio and Bambu Handy show it.
 ///
-/// The `bambu-camera` helper (next to the app's executable) runs Bambu Studio's own network plugins to get
-/// the stream and sends back H.264; this decodes it into `layer`. PrinterStore keeps it alive until the camera is turned off or the app quits.
+/// It rides on the `CloudAgent` session: the helper sends back H.264, which this decodes once and shows on every
+/// attached `screens` layer. PrinterStore keeps it alive until the camera is turned off or the app quits.
 @MainActor
 @Observable
 final class CameraStream {
@@ -46,196 +26,101 @@ final class CameraStream {
         case rejected
         case busy
         case unavailable(String)
+
+        init(_ problem: CloudAgent.Problem) {
+            switch problem {
+            case .needsStudio: self = .needsStudio
+            case .signedOut: self = .signedOut
+            case .notOnAccount: self = .notOnAccount
+            case .rejected: self = .rejected
+            case .unavailable(let reason): self = .unavailable(reason)
+            }
+        }
     }
 
-    private(set) var phase: Phase = .idle
     private(set) var videoSize: CGSize?
+    private(set) var isActive = false
+    private var cameraPhase: Phase = .idle
 
-    @ObservationIgnored let layer = AVSampleBufferDisplayLayer()
-    @ObservationIgnored private var process: Process?
-    @ObservationIgnored private var input: FileHandle?
-    @ObservationIgnored private var dataFolder: URL?
-    @ObservationIgnored private var packager: VideoPackager?
+    @ObservationIgnored let screens = CameraScreens()
+    @ObservationIgnored private let agent: CloudAgent
+    @ObservationIgnored private var firmware: String?
     @ObservationIgnored private var generation = 0
-    @ObservationIgnored private var target: (serial: String, firmware: String?)?
     @ObservationIgnored private var lastFrame = Date.distantPast
     @ObservationIgnored private var watchdog: Timer?
     @ObservationIgnored private var restarts = 0
-    @ObservationIgnored private var observers: [NSObjectProtocol] = []
 
-    private static let clientIDKey = "cameraClientID"
-
-    init() {
-        layer.videoGravity = .resizeAspect
-        layer.backgroundColor = NSColor.black.cgColor
+    init(agent: CloudAgent) {
+        self.agent = agent
+        agent.onCameraState = { [weak self] state, detail in self?.received(state: state, detail: detail) }
     }
 
-    var isRunning: Bool { process != nil }
+    /// The cloud session's progress until it's ready, then the camera's own.
+    var phase: Phase {
+        guard isActive else { return .idle }
+        switch agent.phase {
+        case .idle: return .starting("Starting…")
+        case .starting(let step): return .starting(step)
+        case .failed(let problem): return .failed(Problem(problem))
+        case .ready: return cameraPhase
+        }
+    }
 
-    func start(serial: String, firmware: String?) {
-        halt()
-        target = (serial, firmware)
+    func start(firmware: String?) {
+        stop()
+        isActive = true
+        self.firmware = firmware
         restarts = 0
-        observeSleep()
-        launch()
-    }
-
-    func stop() {
-        target = nil
-        halt()
-        for observer in observers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
-        observers = []
-        phase = .idle
-        videoSize = nil
-    }
-
-    /// The cloud session doesn't survive sleep; stop before it and start over after waking.
-    private func observeSleep() {
-        guard observers.isEmpty else { return }
-        let center = NSWorkspace.shared.notificationCenter
-        observers.append(center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated {
-                self?.halt()
-                self?.phase = .starting("Waiting for the network…")
-            }
-        })
-        observers.append(center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self, self.target != nil else { return }
-                Task { @MainActor in
-                    try? await Task.sleep(for: .seconds(3))
-                    guard self.target != nil, self.process == nil else { return }
-                    self.restarts = 0
-                    self.launch()
-                }
-            }
-        })
-    }
-
-    // MARK: - Helper process
-
-    private func launch() {
-        guard let target else { return }
-        guard let studio = BambuStudioInstall.find() else { return fail(.needsStudio) }
-        let cloud = BambuCloud.shared
-        guard cloud.isSignedIn, !cloud.needsSignIn else { return fail(.signedOut) }
-        if !cloud.devices.isEmpty, cloud.device(serial: target.serial) == nil { return fail(.notOnAccount) }
-        guard let userInfo = cloud.pluginUserInfo() else { return fail(.signedOut) }
-        guard let helper = Bundle.main.url(forAuxiliaryExecutable: "bambu-camera") else {
-            return fail(.unavailable("The camera helper is missing from the app."))
-        }
-
-        generation += 1
-        let generation = generation
-        phase = .starting("Starting…")
-
-        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("BambuBar-camera-\(UUID().uuidString)")
-        do {
-            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            let conf = #"{"app":{"country_code":"US","language":"en_US","region":"US"}}"#
-            try Data(conf.utf8).write(to: folder.appendingPathComponent("BambuStudio.conf"))
-        } catch {
-            return fail(.unavailable("Couldn't prepare the camera: \(error.localizedDescription)"))
-        }
-        dataFolder = folder
-
-        let os = ProcessInfo.processInfo.operatingSystemVersion
-        let settings: [(String, String)] = [
-            ("plugin_dir", studio.pluginFolder.path),
-            ("cert_dir", studio.certFolder.path),
-            ("data_dir", folder.path),
-            ("dev_id", target.serial),
-            ("dev_ver", target.firmware ?? ""),
-            ("client_version", studio.version),
-            ("os_version", "\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"),
-            ("country", "US"),
-            ("cli_id", Self.clientID),
-            ("log_file", Self.logFolder.appendingPathComponent("camera.log").path),
-            ("dump_file", UserDefaults.standard.bool(forKey: "cameraDump") ? Self.logFolder.appendingPathComponent("camera.h264").path : ""),
-            ("user_info", userInfo),
-        ]
-        let config = settings.map { "\($0.0)=\($0.1.replacingOccurrences(of: "\n", with: ""))\n" }.joined() + "\n"
-
-        let stdin = Pipe(), stdout = Pipe()
-        let process = Process()
-        process.executableURL = helper
-        process.standardInput = stdin
-        process.standardOutput = stdout
-        process.standardError = ProcessInfo.processInfo.environment["BAMBU_CAMERA_VERBOSE"] == nil ? FileHandle.nullDevice : FileHandle.standardError
-
-        let packager = VideoPackager(layer: layer)
-        packager.onStatus = { [weak self] json in
-            DispatchQueue.main.async { self?.received(status: json, generation: generation) }
-        }
-        packager.onPicture = { [weak self] size in
-            DispatchQueue.main.async { self?.picture(size: size, generation: generation) }
-        }
-        let reader = FrameReader(packager: packager)
-        stdout.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            if data.isEmpty { handle.readabilityHandler = nil } else { reader.consume(data) }
-        }
-        process.terminationHandler = { [weak self] proc in
-            let code = proc.terminationStatus
-            DispatchQueue.main.async { self?.exited(code: code, generation: generation) }
-        }
-
-        do {
-            try process.run()
-        } catch {
-            return fail(.unavailable("The camera helper didn't start: \(error.localizedDescription)"))
-        }
-        stdin.fileHandleForWriting.write(Data(config.utf8))
-        self.process = process
-        input = stdin.fileHandleForWriting
-        self.packager = packager
-        lastFrame = Date()
+        openCamera()
         watchdog = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.checkStall() }
         }
     }
 
-    /// Ends the helper and its session without changing what's shown.
-    private func halt() {
+    func stop() {
+        guard isActive else { return }
+        isActive = false
         generation += 1
         watchdog?.invalidate()
         watchdog = nil
-        if let process {
-            // Closing stdin tells the helper to quit at once; the kill is in case the plugin hangs it.
-            try? input?.close()
-            let pid = process.processIdentifier
-            DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
-                if process.isRunning { kill(pid, SIGKILL) }
-            }
+        agent.video.set(nil)
+        agent.stopCamera()
+        cameraPhase = .idle
+        videoSize = nil
+        screens.clear()
+    }
+
+    /// A fresh decoder and a new camera request on the running session.
+    private func openCamera() {
+        generation += 1
+        let generation = generation
+        let packager = VideoPackager(screens: screens)
+        packager.onPicture = { [weak self] size in
+            DispatchQueue.main.async { self?.picture(size: size, generation: generation) }
         }
-        process = nil
-        input = nil
-        packager = nil
-        if let folder = dataFolder {
-            DispatchQueue.global().asyncAfter(deadline: .now() + 3) { try? FileManager.default.removeItem(at: folder) }
-        }
-        dataFolder = nil
-        layer.sampleBufferRenderer.flush(removingDisplayedImage: false, completionHandler: nil)
+        agent.video.set { type, payload in packager.handle(type: type, payload: payload) }
+        cameraPhase = .starting("Asking Bambu for the camera…")
+        lastFrame = Date()
+        agent.startCamera(firmware: firmware)
     }
 
     private func fail(_ problem: Problem) {
-        halt()
-        phase = .failed(problem)
+        watchdog?.invalidate()
+        watchdog = nil
+        agent.video.set(nil)
+        agent.stopCamera()
+        cameraPhase = .failed(problem)
     }
 
-    private func received(status json: Data, generation: Int) {
-        guard generation == self.generation,
-              let object = (try? JSONSerialization.jsonObject(with: json)) as? [String: Any],
-              let state = object["state"] as? String else { return }
-        let detail = object["detail"] as? String ?? ""
+    private func received(state: String, detail: String) {
+        guard isActive else { return }
         switch state {
-        case "loading": phase = .starting("Starting…")
-        case "signing_in": phase = .starting("Signing in to Bambu…")
-        case "connecting": phase = .starting("Connecting to the printer…")
-        case "minting": if phase != .live { phase = .starting("Asking Bambu for the camera…") }
-        case "opening": if phase != .live { phase = .starting("Opening the camera…") }
-        case "streaming": if phase != .live { phase = .starting("Waiting for the first picture…") }
-        case "error:auth": fail(.rejected)
+        case "starting":
+            cameraPhase = .starting("Asking Bambu for the camera…")
+            lastFrame = Date()
+        case "minting": if cameraPhase != .live { cameraPhase = .starting("Asking Bambu for the camera…") }
+        case "opening": if cameraPhase != .live { cameraPhase = .starting("Opening the camera…") }
+        case "streaming": if cameraPhase != .live { cameraPhase = .starting("Waiting for the first picture…") }
         case "error:busy": fail(.busy)
         default:
             if state.hasPrefix("error:") { fail(.unavailable(detail.isEmpty ? "The camera didn't open." : detail)) }
@@ -243,87 +128,103 @@ final class CameraStream {
     }
 
     private func picture(size: CGSize, generation: Int) {
-        guard generation == self.generation else { return }
+        guard generation == self.generation, isActive else { return }
         lastFrame = Date()
         restarts = 0
         if videoSize != size { videoSize = size }
-        if phase != .live { phase = .live }
-    }
-
-    private func exited(code: Int32, generation: Int) {
-        guard generation == self.generation else { return }
-        if case .failed = phase { return }
-        process = nil
-        fail(.unavailable(code == 0 ? "The camera stream ended." : "The camera helper stopped (\(code))."))
+        if cameraPhase != .live { cameraPhase = .live }
     }
 
     /// The helper re-opens a dropped stream itself; this catches one that stalls without an error.
     private func checkStall() {
-        guard process != nil else { return }
+        guard isActive, agent.phase == .ready else {
+            lastFrame = Date()
+            return
+        }
         let silence = Date().timeIntervalSince(lastFrame)
-        let limit: TimeInterval = phase == .live ? 20 : 120
+        let limit: TimeInterval = cameraPhase == .live ? 20 : 120
         guard silence > limit else { return }
         guard restarts < 3 else { return fail(.unavailable("The camera stopped sending pictures.")) }
         restarts += 1
-        halt()
-        launch()
-    }
-
-    /// `~/Library/Logs/Bambu Bar`: the helper's trace of the last session (no tokens or camera links).
-    private static var logFolder: URL {
-        let folder = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Bambu Bar")
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        return folder
-    }
-
-    /// Bambu Studio sends one stable id per installation with every camera session.
-    private static var clientID: String {
-        if let id = UserDefaults.standard.string(forKey: clientIDKey) { return id }
-        let id = UUID().uuidString.lowercased()
-        UserDefaults.standard.set(id, forKey: clientIDKey)
-        return id
+        openCamera()
     }
 }
 
-/// Splits the helper's output into frames: [type u8][length u32 BE][payload].
-private final class FrameReader: @unchecked Sendable {
-    private var buffer = Data()
-    private let packager: VideoPackager
+/// Every view showing the camera has its own display layer; they all get the same decoded frames.
+/// The latest frame is kept so a view that opens mid-stream shows a picture at once instead of waiting for a keyframe.
+final class CameraScreens: @unchecked Sendable {
+    private let lock = NSLock()
+    private let layers = NSHashTable<AVSampleBufferDisplayLayer>.weakObjects()
+    private var latest: CVPixelBuffer?
 
-    init(packager: VideoPackager) { self.packager = packager }
-
-    func consume(_ data: Data) {
-        buffer.append(data)
-        var offset = buffer.startIndex
-        while buffer.endIndex - offset >= 5 {
-            let length = Int(buffer[offset + 1]) << 24 | Int(buffer[offset + 2]) << 16 | Int(buffer[offset + 3]) << 8 | Int(buffer[offset + 4])
-            guard buffer.endIndex - offset - 5 >= length else { break }
-            let type = buffer[offset]
-            let payload = buffer.subdata(in: (offset + 5)..<(offset + 5 + length))
-            offset += 5 + length
-            packager.handle(type: type, payload: payload)
+    func attach(_ layer: AVSampleBufferDisplayLayer) {
+        let frame = lock.withLock {
+            layers.add(layer)
+            return latest
         }
-        buffer.removeSubrange(buffer.startIndex..<offset)
+        if let frame { Self.show(frame, on: layer) }
+    }
+
+    func detach(_ layer: AVSampleBufferDisplayLayer) {
+        lock.withLock { layers.remove(layer) }
+    }
+
+    func show(_ frame: CVPixelBuffer) {
+        let targets = lock.withLock {
+            latest = frame
+            return layers.allObjects
+        }
+        for layer in targets { Self.show(frame, on: layer) }
+    }
+
+    func clear() {
+        lock.withLock { latest = nil }
+    }
+
+    private static func show(_ frame: CVPixelBuffer, on layer: AVSampleBufferDisplayLayer) {
+        let renderer = layer.sampleBufferRenderer
+        if renderer.status == .failed || renderer.requiresFlushToResumeDecoding { renderer.flush() }
+        guard let sample = sampleBuffer(frame) else { return }
+        renderer.enqueue(sample)
+    }
+
+    private static func sampleBuffer(_ frame: CVPixelBuffer) -> CMSampleBuffer? {
+        var format: CMVideoFormatDescription?
+        guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: frame,
+                                                           formatDescriptionOut: &format) == noErr, let format else { return nil }
+        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()), decodeTimeStamp: .invalid)
+        var sample: CMSampleBuffer?
+        guard CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: frame, formatDescription: format,
+                                                       sampleTiming: &timing, sampleBufferOut: &sample) == noErr, let sample else { return nil }
+        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true), CFArrayGetCount(attachments) > 0 {
+            let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
+            CFDictionarySetValue(dict, Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+                                 Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+        }
+        return sample
     }
 }
 
-/// Turns the stream's H.264 (Annex B, or length-prefixed) into sample buffers for the display layer.
+/// Turns the stream's H.264 (Annex B, or length-prefixed) into decoded frames for `CameraScreens`.
 private final class VideoPackager: @unchecked Sendable {
-    var onStatus: ((Data) -> Void)?
     var onPicture: ((CGSize) -> Void)?
 
-    private let layer: AVSampleBufferDisplayLayer
+    private let screens: CameraScreens
     private var sps: Data?
     private var pps: Data?
     private var format: CMVideoFormatDescription?
+    private var decoder: VTDecompressionSession?
     private var needsKeyframe = true
     private var lastReport = Date.distantPast
 
-    init(layer: AVSampleBufferDisplayLayer) { self.layer = layer }
+    init(screens: CameraScreens) { self.screens = screens }
+
+    deinit {
+        if let decoder { VTDecompressionSessionInvalidate(decoder) }
+    }
 
     func handle(type: UInt8, payload: Data) {
         switch type {
-        case UInt8(ascii: "S"): onStatus?(payload)
         case UInt8(ascii: "I") where payload.count >= 20: parameters(from: payload.dropFirst(20))
         case UInt8(ascii: "V") where payload.count > 9: video(Data(payload.dropFirst(9)))
         default: break
@@ -384,6 +285,12 @@ private final class VideoPackager: @unchecked Sendable {
             }
         }
         format = description
+        resetDecoder()
+    }
+
+    private func resetDecoder() {
+        if let decoder { VTDecompressionSessionInvalidate(decoder) }
+        decoder = nil
         needsKeyframe = true
     }
 
@@ -403,23 +310,37 @@ private final class VideoPackager: @unchecked Sendable {
             }
         }
         guard let format, !block.isEmpty else { return }
-        let renderer = layer.sampleBufferRenderer
-        if renderer.status == .failed || renderer.requiresFlushToResumeDecoding {
-            renderer.flush()
-            needsKeyframe = true
-        }
         if needsKeyframe {
             guard keyframe else { return }
             needsKeyframe = false
         }
         guard let sample = Self.sampleBuffer(block, format: format) else { return }
-        renderer.enqueue(sample)
-        let now = Date()
-        if now.timeIntervalSince(lastReport) > 1 {
-            lastReport = now
-            let size = CMVideoFormatDescriptionGetDimensions(format)
-            onPicture?(CGSize(width: Int(size.width), height: Int(size.height)))
+        decode(sample, format: format)
+    }
+
+    private func decode(_ sample: CMSampleBuffer, format: CMVideoFormatDescription) {
+        if decoder == nil {
+            let attributes = [kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary] as CFDictionary
+            var session: VTDecompressionSession?
+            VTDecompressionSessionCreate(allocator: kCFAllocatorDefault, formatDescription: format, decoderSpecification: nil,
+                                         imageBufferAttributes: attributes, outputCallback: nil, decompressionSessionOut: &session)
+            decoder = session
         }
+        guard let decoder else { return }
+        var frameFailed = false
+        let status = VTDecompressionSessionDecodeFrame(decoder, sampleBuffer: sample, flags: [], infoFlagsOut: nil) { [weak self] status, _, image, _, _ in
+            guard status == noErr, let image else { frameFailed = true; return }
+            self?.decoded(image)
+        }
+        if status != noErr || frameFailed { resetDecoder() }
+    }
+
+    private func decoded(_ frame: CVPixelBuffer) {
+        screens.show(frame)
+        let now = Date()
+        guard now.timeIntervalSince(lastReport) > 1 else { return }
+        lastReport = now
+        onPicture?(CGSize(width: CVPixelBufferGetWidth(frame), height: CVPixelBufferGetHeight(frame)))
     }
 
     private static func sampleBuffer(_ data: Data, format: CMVideoFormatDescription) -> CMSampleBuffer? {
@@ -435,11 +356,6 @@ private final class VideoPackager: @unchecked Sendable {
         guard CMSampleBufferCreateReady(allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: format, sampleCount: 1,
                                         sampleTimingEntryCount: 0, sampleTimingArray: nil, sampleSizeEntryCount: 1,
                                         sampleSizeArray: &size, sampleBufferOut: &sample) == noErr, let sample else { return nil }
-        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true), CFArrayGetCount(attachments) > 0 {
-            let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
-            CFDictionarySetValue(dict, Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
-                                 Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
-        }
         return sample
     }
 

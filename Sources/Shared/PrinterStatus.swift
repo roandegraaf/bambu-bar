@@ -72,6 +72,22 @@ struct Temperature: Codable, Equatable, Sendable {
     var isAtTarget: Bool { target > 0 && abs(current - target) <= 2 }
 }
 
+struct NozzleInfo: Codable, Equatable, Identifiable, Sendable {
+    var id: Int
+    var diameter: Double?
+    var type: String?
+}
+
+/// One hotend. On dual-nozzle printers id 0 is the right extruder and id 1 the left.
+struct Extruder: Codable, Equatable, Identifiable, Sendable {
+    var id: Int
+    var temperature: Temperature
+    var nozzle: NozzleInfo?
+    var isActive: Bool
+
+    var side: String { id == 1 ? "Left" : "Right" }
+}
+
 /// One filament slot: an AMS tray or the external spool holder.
 struct Spool: Codable, Equatable, Identifiable, Sendable {
     /// Global slot number: `unit * 4 + slot` for AMS units 0-3, `128 + n` for AMS HT, 254 for the external spool.
@@ -173,7 +189,12 @@ struct PrinterStatus: Codable, Equatable, Sendable {
     var remainingMinutes: Int = 0
     var layer: Int = 0
     var totalLayers: Int = 0
+    /// The active extruder's temperature.
     var nozzle = Temperature(current: 0, target: 0)
+    /// Every extruder, left to right; empty on firmware without the `device.extruder` block.
+    var extruders: [Extruder] = []
+    /// Spare hotends parked in the H2C nozzle rack.
+    var rackNozzles: [NozzleInfo] = []
     var bed = Temperature(current: 0, target: 0)
     var chamber: Double?
     /// Fan speeds in percent.
@@ -183,6 +204,8 @@ struct PrinterStatus: Codable, Equatable, Sendable {
     var heatbreakFan: Int?
     var speed: SpeedLevel = .standard
     var chamberLightOn: Bool?
+    /// The LED nodes that make up the chamber light (H2 printers report a second one, `chamber_light2`).
+    var chamberLightNodes: [String]?
     var doorOpen: Bool?
     var wifiSignal: Int?
     var ams: [AMSUnit] = []
@@ -238,6 +261,10 @@ struct PrinterStatus: Codable, Equatable, Sendable {
     }
 
     var allSpools: [Spool] { ams.flatMap(\.spools) + (externalSpool.map { [$0] } ?? []) }
+
+    var hasMultipleExtruders: Bool { extruders.count > 1 }
+
+    var activeExtruder: Extruder? { extruders.first(where: \.isActive) ?? extruders.min { $0.id < $1.id } }
 
     var mostSevereIssue: PrinterIssue? { issues.min { $0.severity < $1.severity } }
 

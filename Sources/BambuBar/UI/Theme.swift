@@ -53,6 +53,21 @@ struct SectionLabel: View {
 }
 
 /// A temperature readout: value large, target small, a hairline gauge underneath.
+/// One tile per extruder on dual-nozzle printers, otherwise a single "Nozzle" tile. Lays out as separate cells.
+struct NozzleTiles: View {
+    var status: PrinterStatus
+
+    var body: some View {
+        if status.hasMultipleExtruders {
+            ForEach(status.extruders) { e in
+                TemperatureTile(title: e.side, symbol: "flame.fill", temperature: e.temperature, tint: Palette.nozzle, maxValue: 300)
+            }
+        } else {
+            TemperatureTile(title: "Nozzle", symbol: "flame.fill", temperature: status.nozzle, tint: Palette.nozzle, maxValue: 300)
+        }
+    }
+}
+
 struct TemperatureTile: View {
     var title: String
     var symbol: String
@@ -69,6 +84,8 @@ struct TemperatureTile: View {
                     .foregroundStyle(heating ? tint : .secondary)
                     .symbolEffect(.pulse, options: .repeating, isActive: rising)
                 Text(title).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
             }
             HStack(alignment: .firstTextBaseline, spacing: 3) {
                 Text(current.map { "\(Int($0.rounded()))°" } ?? "–")

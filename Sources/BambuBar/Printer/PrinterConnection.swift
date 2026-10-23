@@ -46,6 +46,32 @@ enum PrinterModels {
     }
 }
 
+/// Commands for the printer. The job commands (all but the light) are the ones printers with signed-command
+/// firmware only take from Bambu's own apps, or from Bambu Bar via Bambu Cloud.
+enum PrinterCommand {
+    case pause, resume, stop
+    case speed(SpeedLevel)
+    case light(node: String, on: Bool)
+
+    /// The request's top-level key.
+    var key: String {
+        if case .light = self { return "system" }
+        return "print"
+    }
+
+    var body: [String: Any] {
+        switch self {
+        case .pause: return ["command": "pause", "param": ""]
+        case .resume: return ["command": "resume", "param": ""]
+        case .stop: return ["command": "stop", "param": ""]
+        case .speed(let level): return ["command": "print_speed", "param": "\(level.rawValue)"]
+        case .light(let node, let on):
+            return ["command": "ledctrl", "led_node": node, "led_mode": on ? "on" : "off",
+                    "led_on_time": 500, "led_off_time": 500, "loop_times": 0, "interval_time": 0]
+        }
+    }
+}
+
 /// Keeps one MQTT session to the printer alive: connects, re-requests a full report, merges the deltas
 /// into a status, and reconnects with back-off when the printer drops off the network or the Mac sleeps.
 @MainActor
@@ -125,17 +151,7 @@ final class PrinterConnection {
 
     // MARK: - Commands
 
-    func pause() { sendPrint(["command": "pause"]) }
-    func resume() { sendPrint(["command": "resume"]) }
-    func stopPrint() { sendPrint(["command": "stop"]) }
-    func setSpeed(_ level: SpeedLevel) { sendPrint(["command": "print_speed", "param": "\(level.rawValue)"]) }
-
-    func setChamberLight(_ on: Bool) {
-        send(["system": ["command": "ledctrl", "led_node": "chamber_light", "led_mode": on ? "on" : "off",
-                         "led_on_time": 500, "led_off_time": 500, "loop_times": 0, "interval_time": 0]], key: "system")
-    }
-
-    private func sendPrint(_ body: [String: Any]) { send(["print": body], key: "print") }
+    func send(_ command: PrinterCommand) { send([command.key: command.body], key: command.key) }
 
     private func send(_ message: [String: Any], key: String) {
         guard let config, let client, phase == .online else { return }
@@ -190,6 +206,10 @@ final class PrinterConnection {
             if let p = json["print"] as? [String: Any], let command = p["command"] as? String,
                command != "push_status", let result = p["result"] as? String {
                 onAck?(command, result.lowercased() == "success", p["reason"] as? String)
+            }
+            if let s = json["system"] as? [String: Any], let command = s["command"] as? String,
+               command == "ledctrl", let result = s["result"] as? String {
+                onAck?(command, result.lowercased() == "success", s["reason"] as? String)
             }
             guard document.apply(json) else { return }
             guard document.hasFullReport || document.print["gcode_state"] != nil else { return }
